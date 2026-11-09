@@ -1,0 +1,20 @@
+{
+  "name": "high-concurrency-ticket-backend",
+  "version": "2.0.0",
+  "description": "High concurrency ticket booking system with Node.js, Express, Redis, RabbitMQ (Topic Exchange), and MySQL (OCC)",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "worker:concert": "QUEUE_NAME=concert_order_queue node src/workers/orderWorker.js",
+    "worker:movie": "QUEUE_NAME=movie_order_queue node src/workers/orderWorker.js",
+    "worker:comedy": "QUEUE_NAME=comedy_order_queue node src/workers/orderWorker.js"
+  },
+  "dependencies": {
+    "amqplib": "^10.3.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mysql2": "^3.9.2",
+    "redis": "^4.6.13"
+  }
+}
