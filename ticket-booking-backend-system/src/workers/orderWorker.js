@@ -1,63 +1,119 @@
-const pool = require('../config/db');
-const { connectRabbitMQ, getChannel } = require('../config/rabbitmq');
-const { releaseSeatLock } = require('../services/luaScripts');
+const pool = require("../config/db");
+const { connectRabbitMQ, getChannel } = require("../config/rabbitmq");
+const { releaseSeatLock } = require("../services/luaScripts");
 
-const QUEUE_NAME = process.env.QUEUE_NAME || 'concert_order_queue';
+const QUEUE_NAME = process.env.QUEUE_NAME || "concert_order_queue";
 
 async function startWorker() {
-    await connectRabbitMQ();
-    const channel = getChannel();
+  await connectRabbitMQ();
 
-    // Limit unacknowledged messages per worker to protect MySQL connection pool
-    await channel.prefetch(10);
+  const channel = getChannel();
 
-    console.log(`Order worker listening on ${QUEUE_NAME}...`);
+  await channel.prefetch(10);
 
-    channel.consume(QUEUE_NAME, async (msg) => {
-        if (!msg) return;
+  console.log(`Order worker listening on ${QUEUE_NAME}...`);
 
+  channel.consume(
+    QUEUE_NAME,
+    async (msg) => {
+      if (!msg) return;
+
+      let connection;
+
+      try {
         const content = JSON.parse(msg.content.toString());
-        const { seatId, userId, paymentIntentId, expectedVersion, eventType } = content;
 
-        const connection = await pool.getConnection();
-        try {
-            await connection.beginTransaction();
+        const { seatId, userId, paymentIntentId, expectedVersion, eventType } =
+          content;
 
-            // 1. Perform OCC update on MySQL seats table
-            const [updateResult] = await connection.execute(
-                `UPDATE seats 
-                 SET status = 'SOLD', user_id = ?, version = version + 1 
-                 WHERE seat_id = ? AND version = ? AND status = 'LOCKED'`,
-                [userId, seatId, expectedVersion]
-            );
+        if (
+          !seatId ||
+          !userId ||
+          !paymentIntentId ||
+          !Number.isInteger(expectedVersion) ||
+          !eventType
+        ) {
+          console.error("Invalid booking message:", content);
 
-            if (updateResult.affectedRows === 0) {
-                await connection.rollback();
-                throw new Error(`OCC_CONFLICT: Seat ${seatId} version mismatch or already updated.`);
-            }
-
-            // 2. Insert into immutable orders ledger
-            await connection.execute(
-                `INSERT INTO orders (payment_intent_id, seat_id, user_id, event_type, status, created_at) 
-                 VALUES (?, ?, ?, ?, 'CONFIRMED', NOW())`,
-                [paymentIntentId, seatId, userId, eventType]
-            );
-
-            await connection.commit();
-            console.log(`[SUCCESS][${QUEUE_NAME}] Order committed for Seat ${seatId}, User ${userId}`);
-            
-            channel.ack(msg);
-
-        } catch (error) {
-            await connection.rollback();
-            console.error(`[ERROR][${QUEUE_NAME}] Seat ${seatId}:`, error.message);
-
-            await releaseSeatLock(seatId);
-            channel.ack(msg);
-        } finally {
-            connection.release();
+          // Permanently reject malformed messages.
+          channel.nack(msg, false, false);
+          return;
         }
-    }, { noAck: false });
+
+        connection = await pool.getConnection();
+
+        await connection.beginTransaction();
+
+        console.log(
+          `[PROCESSING] Seat ${seatId}, User ${userId}, Version ${expectedVersion}`,
+        );
+
+        // 1. OCC update
+        const [updateResult] = await connection.execute(
+          `UPDATE seats
+           SET status = 'SOLD',
+               user_id = ?,
+               version = version + 1
+           WHERE seat_id = ?
+             AND version = ?
+             AND status = 'AVAILABLE'`,
+          [userId, seatId, expectedVersion],
+        );
+
+        if (updateResult.affectedRows === 0) {
+          await connection.rollback();
+
+          console.log(`[OCC_CONFLICT] Seat ${seatId}`);
+
+          // Business conflict: retrying won't fix this.
+          await releaseSeatLock(seatId, userId);
+
+          channel.ack(msg);
+          return;
+        }
+
+        // 2. Insert order
+        await connection.execute(
+          `INSERT INTO orders
+           (payment_intent_id, seat_id, user_id, event_type, status, created_at)
+           VALUES (?, ?, ?, ?, 'CONFIRMED', NOW())`,
+          [paymentIntentId, seatId, userId, eventType],
+        );
+
+        // 3. Commit both operations together
+        await connection.commit();
+
+        console.log(
+          `[SUCCESS] Order committed for Seat ${seatId}, User ${userId}`,
+        );
+
+        // 4. Acknowledge only after successful commit
+        channel.ack(msg);
+      } catch (error) {
+        if (connection) {
+          try {
+            await connection.rollback();
+          } catch (rollbackError) {
+            console.error("Rollback failed:", rollbackError.message);
+          }
+        }
+
+        console.error(`[WORKER_ERROR] ${error.message}`);
+
+        // Temporary infrastructure errors:
+        // requeue so RabbitMQ can deliver the message again.
+        channel.nack(msg, false, true);
+      } finally {
+        if (connection) {
+          connection.release();
+        }
+      }
+    },
+    { noAck: false },
+  );
 }
 
-startWorker();
+startWorker().catch((error) => {
+  console.error("Worker startup failed:", error);
+  process.exit(1);
+});

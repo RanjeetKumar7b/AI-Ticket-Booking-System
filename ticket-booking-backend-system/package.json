@@ -11,10 +11,13 @@
     "worker:comedy": "QUEUE_NAME=comedy_order_queue node src/workers/orderWorker.js"
   },
   "dependencies": {
-    "amqplib": "^10.3.0",
+    "amqplib": "^2.2.1",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "mysql2": "^3.9.2",
     "redis": "^4.6.13"
+  },
+  "devDependencies": {
+    "autocannon": "^9.0.0"
   }
 }
